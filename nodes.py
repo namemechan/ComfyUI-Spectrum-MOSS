@@ -376,8 +376,15 @@ class HistoryWeightChebyshevForecaster:
             for weight, flat in zip(weights, flats):
                 if weight != 0.0:
                     acc.add_(flat[start:stop].to(torch.float32), alpha=float(weight))
+            # Do not silently turn invalid forecasts into zeros. That can produce
+            # a plausible-looking tensor and prevent the wrapper's real-step
+            # fallback from running, resulting in blank or corrupted images.
+            if not bool(torch.isfinite(acc).all()):
+                raise FloatingPointError(
+                    f"Spectrum forecast contains NaN/Inf in feature range [{start}:{stop}]"
+                )
+
             if finfo is not None:
-                torch.nan_to_num_(acc, nan=0.0, posinf=float(finfo.max), neginf=float(finfo.min))
                 acc.clamp_(min=float(finfo.min), max=float(finfo.max))
             out_flat[start:stop] = acc.to(self._feature_dtype)
         return out
@@ -977,6 +984,15 @@ def _run_actual(
         handle.remove()
 
     feature = captured.get("feature")
+    if feature is not None and not bool(torch.isfinite(feature).all()):
+        # Never retain an invalid actual hidden state as a future forecast anchor.
+        branch.reset()
+        feature = None
+        _log_warning(
+            f"non-finite last-block hidden state at step {step_index + 1}; "
+            "forecast history cleared and subsequent steps will use real inference"
+        )
+
     if feature is not None:
         tail_start = max(0, total_steps - config.tail_actual_steps) if config.tail_actual_steps > 0 else total_steps
         adaptive_action_start = config.warmup_steps
@@ -1020,28 +1036,106 @@ def _run_actual(
     return out
 
 
+def _logical_parameter_dtype(parameter: Any) -> Optional[torch.dtype]:
+    """Return a parameter's logical floating dtype, including quantized weights.
+
+    ComfyUI QuantizedTensor wrappers may expose an integer storage dtype while
+    keeping the activation/compute dtype in ``_params.orig_dtype``. The FP32
+    precision patch uses the same logical-dtype rule for its bridge hooks.
+    """
+    if parameter is None:
+        return None
+
+    params = getattr(parameter, "_params", None)
+    if params is None:
+        params = getattr(parameter, "params", None)
+    logical = getattr(params, "orig_dtype", None) if params is not None else None
+    if isinstance(logical, torch.dtype) and logical.is_floating_point:
+        return logical
+
+    dtype = getattr(parameter, "dtype", None)
+    if isinstance(dtype, torch.dtype) and dtype.is_floating_point:
+        return dtype
+    return None
+
+
+def _module_compute_dtype(module: Any, fallback: torch.dtype) -> torch.dtype:
+    """Infer the activation dtype expected by a module from its first weight."""
+    try:
+        for parameter in module.parameters(recurse=True):
+            dtype = _logical_parameter_dtype(parameter)
+            if dtype is not None:
+                return dtype
+    except Exception:
+        pass
+    return fallback
+
+
 def _run_moss_head(core: Any, x: torch.Tensor, timestep: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
-    """Run MOSS' timestep-conditioned output head on a forecast last-block state."""
-    dtype = x.dtype
+    """Run MOSS' timestep-conditioned output head on a forecast last-block state.
+
+    The native MOSS forward path and the FP32 patch establish dtype boundaries
+    from each module's own weights. Do not use the latent input dtype here:
+    with the FP32 patch enabled, x can be BF16 while the final norm/head weights
+    are FP32. The functional ``modulated_rms_norm`` call bypasses a module
+    forward-pre-hook, so its input and modulation tensors must be cast here.
+    """
     device = x.device
     batch, _, height, width = x.shape
+    expected_tokens = height * width
 
-    hidden = feature.to(device=device, dtype=dtype, non_blocking=(feature.device.type == device.type))
-    vec = core.time_embedding(timestep_embedding(timestep, 256).to(dtype))
+    if feature.ndim != 3:
+        raise ValueError(f"expected last-block feature [B,T,D], got {tuple(feature.shape)}")
+    if int(feature.shape[0]) != batch or int(feature.shape[1]) != expected_tokens:
+        raise ValueError(
+            "last-block feature shape does not match latent image: "
+            f"feature={tuple(feature.shape)}, latent={tuple(x.shape)}"
+        )
+
+    # The sinusoidal embedding is fed to the first Linear in time_embedding.
+    # Preserve the module's logical dtype before any low-precision conversion.
+    time_dtype = _module_compute_dtype(core.time_embedding, timestep.dtype)
+    time_input = timestep_embedding(timestep, 256).to(device=device, dtype=time_dtype)
+    vec = core.time_embedding(time_input)
+
+    # Match video_head_modulation's own logical weight dtype. This also handles
+    # QuantizedTensor weights whose storage dtype is not their compute dtype.
+    modulation_dtype = _module_compute_dtype(core.video_head_modulation, vec.dtype)
+    head = core.video_head_modulation(vec.to(device=device, dtype=modulation_dtype))
     head_shift, head_scale = (
-        core.video_head_modulation(vec)
-        .unflatten(-1, (2, -1))
-        .unsqueeze(2)
-        .unbind(1)
+        head.unflatten(-1, (2, -1)).unsqueeze(2).unbind(1)
     )
+
+    # modulated_rms_norm is a functional/fused operation; the final_norm module's
+    # registered forward hooks are not invoked by it. Explicitly align all three
+    # inputs to the final norm's logical weight dtype.
+    norm_dtype = _module_compute_dtype(core.final_norm_video, feature.dtype)
+    hidden = feature.to(
+        device=device,
+        dtype=norm_dtype,
+        non_blocking=(feature.device.type == device.type),
+    ).contiguous()
+    head_shift = head_shift.to(device=device, dtype=norm_dtype)
+    head_scale = head_scale.to(device=device, dtype=norm_dtype)
+
     hidden = modulated_rms_norm(
         hidden,
         core.final_norm_video,
         head_scale,
         head_shift,
     )
+
+    # The final Linear can have a different logical dtype from the norm (for
+    # example in mixed/quantized checkpoints), so establish its boundary too.
+    output_dtype = _module_compute_dtype(core.final_linear_video, hidden.dtype)
+    hidden = hidden.to(dtype=output_dtype).contiguous()
     out = core.final_linear_video(hidden)
-    return out.transpose(1, 2).reshape(batch, int(core.latent_channels), height, width)
+
+    expected_shape = (batch, int(core.latent_channels), height, width)
+    out = out.transpose(1, 2).reshape(expected_shape)
+    if not bool(torch.isfinite(out).all()):
+        raise FloatingPointError("Spectrum output head produced NaN/Inf")
+    return out
 
 
 def _run_forecast(
@@ -1057,6 +1151,10 @@ def _run_forecast(
 ) -> torch.Tensor:
     feature = branch.forecaster.predict(coord)
     out = _run_moss_head(core, x, timestep, feature)
+    if tuple(out.shape) != tuple(x.shape):
+        raise ValueError(
+            f"forecast output shape {tuple(out.shape)} does not match latent shape {tuple(x.shape)}"
+        )
     _log_debug(
         config.debug,
         f"step {step_index + 1}/{total_steps} branch={branch_key} "
@@ -1123,9 +1221,12 @@ def _make_spectrum_wrapper(config: SpectrumConfig, decision_observer=None):
         ):
             branch.reset()
 
+        dit_replacements = transformer_options.get("patches_replace", {}).get("dit", {})
+        replacement_present = isinstance(dit_replacements, dict) and bool(dit_replacements)
         control_present = (
             kwargs.get("control") is not None
             or transformer_options.get("control") is not None
+            or replacement_present
         )
         if runtime_config.er_sde_sync:
             if root.global_decision_step != step_index:
